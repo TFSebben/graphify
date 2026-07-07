@@ -408,7 +408,8 @@ def _legacy_collect_files(target, *, root=None):
     for ext in sorted(extensions):
         results.extend(
             p for p in target.rglob(f"*{ext}")
-            if not any(_is_noise_dir(part) for part in p.parts)
+            if p.suffix == ext
+            and not any(_is_noise_dir(part) for part in p.parts)
             and not (patterns and _is_ignored(p, ignore_root, patterns))
         )
     return sorted(results)
@@ -879,9 +880,11 @@ def test_cross_file_call_promoted_to_extracted_with_import_evidence(tmp_path):
     assert call_edges[0]["confidence_score"] == 1.0
 
 
-def test_cross_file_call_remains_inferred_without_import_evidence(tmp_path):
-    """A cross-file `calls` edge must stay INFERRED when there is no import
-    edge — name collision alone is insufficient evidence."""
+def test_js_cross_file_call_without_import_emits_no_edge(tmp_path):
+    """A JS/TS call with no local definition and no import must NOT bind to a
+    same-named export in another file (#1659). JS/TS modules have no implicit
+    cross-module scope, so name collision alone is not a real call — it used to
+    produce a phantom INFERRED edge that fabricated cross-package dependencies."""
     caller = tmp_path / "caller.js"
     callee = tmp_path / "lib.js"
     # Caller does NOT require lib — same-name function happens to exist elsewhere
@@ -898,8 +901,7 @@ def test_cross_file_call_remains_inferred_without_import_evidence(tmp_path):
         and nodes[e["source"]]["label"] == "run()"
         and nodes[e["target"]]["label"] == "doUnique()"
     ]
-    assert len(call_edges) == 1
-    assert call_edges[0]["confidence"] == "INFERRED"
+    assert call_edges == [], f"unimported cross-file JS call should not resolve: {call_edges}"
 
 
 def test_python_qualified_class_method_call_resolves_extracted(tmp_path):
@@ -1512,6 +1514,56 @@ def test_extract_json_via_dispatch():
     assert _get_extractor(Path("foo.json")) is extract_json
 
 
+def test_extensionless_shebang_via_dispatch(tmp_path):
+    """Extensionless CLIs resolve their extractor from the shebang, mirroring
+    detect.classify_file — otherwise detect labels them code and extraction
+    silently drops them."""
+    from graphify.extract import _get_extractor
+
+    cli = tmp_path / "devctl"
+    cli.write_text("#!/usr/bin/env bash\necho hi\n")
+    assert _get_extractor(cli) is extract_bash
+
+    pytool = tmp_path / "manage"
+    pytool.write_text("#!/usr/bin/env python3\nprint('hi')\n")
+    assert _get_extractor(pytool) is extract_python
+
+    # env -S split-args form is handled by the shared shebang parser
+    split = tmp_path / "runner"
+    split.write_text("#!/usr/bin/env -S bash -eu\necho hi\n")
+    assert _get_extractor(split) is extract_bash
+
+
+def test_extensionless_without_usable_shebang_stays_unsupported(tmp_path):
+    from graphify.extract import _get_extractor
+
+    plain = tmp_path / "LICENSE-COPY"
+    plain.write_text("plain text, no shebang\n")
+    assert _get_extractor(plain) is None
+
+    # Interpreter known to detect but with no AST extractor: stays skipped
+    # rather than being mis-parsed by a wrong grammar.
+    perl = tmp_path / "legacy"
+    perl.write_text("#!/usr/bin/env perl\nprint 1;\n")
+    assert _get_extractor(perl) is None
+
+
+def test_extract_extensionless_bash_cli_end_to_end(tmp_path):
+    """A shebang-only bash CLI must contribute nodes with the same ID scheme
+    as a .sh file (path stem + entity), so doc-created stub IDs merge."""
+    cli = tmp_path / "devctl"
+    cli.write_text(
+        "#!/usr/bin/env bash\n"
+        "helper() { echo hi; }\n"
+        "main() { helper; }\n"
+        'main "$@"\n'
+    )
+    result = extract([cli], cache_root=tmp_path)
+    ids = {n["id"] for n in result["nodes"]}
+    assert "devctl_helper" in ids
+    assert "devctl_main" in ids
+
+
 def test_extract_bash_node_metadata_is_sanitized():
     """Bash extractor must route node metadata through sanitize_metadata so
     HTML-sensitive characters cannot reach downstream graph viewers raw."""
@@ -1692,3 +1744,103 @@ def test_non_colliding_path_id_is_not_salted(tmp_path):
     result = extract([p], cache_root=tmp_path)
     file_id = next(n["id"] for n in result["nodes"] if n.get("source_location") == "L1")
     assert file_id == make_id(_file_stem(Path("src/auth/session.py"))) == "src_auth_session"
+
+
+def test_case_insensitive_suffix_filtering(tmp_path):
+    py_file = tmp_path / "app.PY"
+    js_file = tmp_path / "script.JS"
+    ts_file = tmp_path / "lib.Ts"
+    
+    py_file.write_text("class MyPythonClass:\n    pass\n")
+    js_file.write_text("function myJSFunction() {}\n")
+    ts_file.write_text("export class MyTSClass {}\n")
+    
+    collected = collect_files(tmp_path)
+    collected_names = {f.name for f in collected}
+    assert "app.PY" in collected_names
+    assert "script.JS" in collected_names
+    assert "lib.Ts" in collected_names
+
+    result = extract(collected, cache_root=tmp_path)
+    nodes = result["nodes"]
+    labels = {n.get("label") for n in nodes if "label" in n}
+    
+    assert "MyPythonClass" in labels
+    assert "myJSFunction()" in labels
+    assert "MyTSClass" in labels
+
+
+
+def test_extract_warns_on_code_files_with_no_ast_extractor(tmp_path, capsys):
+    # #1689: .r/.R is in CODE_EXTENSIONS (counted as code) but has no AST extractor,
+    # so R files silently contribute nothing. extract() must surface that instead of
+    # reporting success as if the language were mapped.
+    r1 = tmp_path / "analysis.R"; r1.write_text("f <- function(x) x + 1\n")
+    r2 = tmp_path / "helper.r"; r2.write_text("g <- function(y) y * 2\n")
+    py = tmp_path / "main.py"; py.write_text("def main():\n    return 1\n")
+
+    result = extract([r1, r2, py], cache_root=tmp_path)
+    err = capsys.readouterr().err
+
+    assert "no AST extractor" in err
+    assert ".r (2)" in err            # both R files grouped under the lowercased ext
+    assert "#1689" in err
+    # the Python file still extracts normally
+    labels = [n.get("label") for n in result["nodes"]]
+    assert any(str(l).startswith("main") for l in labels)
+
+
+def test_extract_no_warning_when_all_code_has_extractors(tmp_path, capsys):
+    py = tmp_path / "a.py"; py.write_text("def a():\n    return 1\n")
+    extract([py], cache_root=tmp_path)
+    err = capsys.readouterr().err
+    assert "no AST extractor" not in err
+
+
+def test_extract_progress_final_line_uses_consistent_denominator(tmp_path, capsys):
+    # #1693: intermediate progress lines count against uncached_work; the final
+    # "100%" line must NOT switch to total_files (which includes cached hits and
+    # files with no extractor), or the count appears to jump upward at the end.
+    for i in range(100):
+        (tmp_path / f"m{i}.py").write_text(f"def f{i}():\n    return {i}\n")
+    for i in range(5):
+        (tmp_path / f"s{i}.r").write_text(f"g{i} <- function(x) x\n")  # no extractor
+    paths = sorted(tmp_path.glob("*.py")) + sorted(tmp_path.glob("*.r"))  # total 105
+
+    extract(paths, cache_root=tmp_path, parallel=False)
+    out = capsys.readouterr().out
+
+    # final progress line reports the uncached count (100), not the total (105)
+    assert "100/100 uncached files (100%)" in out
+    assert "105/105 files" not in out, "final line must not switch to total_files (#1693)"
+
+
+def test_get_extractor_routes_matlab_m_away_from_objc(tmp_path):
+    # #1702: .m is shared by Objective-C and MATLAB. A real ObjC .m still routes to
+    # extract_objc, but a MATLAB .m must NOT be force-parsed by the ObjC grammar
+    # (which produces garbage) — it gets no extractor instead.
+    from graphify.extract import _get_extractor, extract_objc
+
+    objc = tmp_path / "Foo.m"
+    objc.write_text('#import "Foo.h"\n@implementation Foo\n- (void)bar {}\n@end\n')
+    matlab_fn = tmp_path / "solver.m"
+    matlab_fn.write_text("function y = solver(x)\n  y = x + 1;\nend\n")
+    matlab_cls = tmp_path / "Model.m"
+    matlab_cls.write_text("classdef Model\n  methods\n    function run(obj); end\n  end\nend\n")
+    mm = tmp_path / "x.mm"
+    mm.write_text("#import <F/F.h>\n@implementation X\n@end\n")
+
+    assert _get_extractor(objc) is extract_objc            # real ObjC .m -> objc
+    assert _get_extractor(matlab_fn) is None               # MATLAB function -> no garbage
+    assert _get_extractor(matlab_cls) is None              # MATLAB classdef -> no garbage
+    assert _get_extractor(mm) is extract_objc              # .mm is unambiguously ObjC++
+
+
+def test_matlab_m_not_extracted_as_garbage(tmp_path, capsys):
+    # End to end: a MATLAB .m produces no (garbage) nodes and is surfaced by the
+    # no-AST-extractor warning (#1702 + #1689), rather than mis-parsed as ObjC.
+    m = tmp_path / "controller.m"
+    m.write_text("function u = controller(x)\n  u = -x;\nend\n")
+    result = extract([m], cache_root=tmp_path)
+    assert result["nodes"] == []                           # no garbage ObjC nodes
+    assert "no AST extractor" in capsys.readouterr().err    # surfaced, not silent
