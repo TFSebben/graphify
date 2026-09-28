@@ -1705,6 +1705,66 @@ def test_elixir_guarded_single_clause_is_extracted(tmp_path):
     )
 
 
+def test_elixir_protocol_and_impl_are_extracted(tmp_path):
+    """`defprotocol`/`defimpl` are module-like containers. Before they were
+    handled, the protocol and implementation nodes were never minted and their
+    functions leaked onto the FILE node instead of their container."""
+    src = tmp_path / "sizeable.ex"
+    src.write_text(
+        "defprotocol Sizeable do\n"
+        "  def size(data)\n"
+        "end\n"
+        "\n"
+        "defimpl Sizeable, for: List do\n"
+        "  def size(data), do: length(data)\n"
+        "end\n"
+    )
+    r = extract_elixir(src)
+    assert "error" not in r
+
+    file_nid = next(n["id"] for n in r["nodes"] if n["label"] == "sizeable.ex")
+    labels = {n["label"] for n in r["nodes"]}
+    assert "Sizeable" in labels
+    assert "Sizeable (for List)" in labels
+
+    lab = {n["id"]: n["label"] for n in r["nodes"]}
+    method_pairs = {
+        (lab.get(e["source"]), lab.get(e["target"]))
+        for e in r["edges"] if e["relation"] == "method"
+    }
+    # the callback and the implementation function belong to their containers
+    assert ("Sizeable", "size()") in method_pairs
+    assert ("Sizeable (for List)", "size()") in method_pairs
+    # ...and NOT to the file (the pre-fix symptom)
+    assert not [
+        e for e in r["edges"]
+        if e["source"] == file_nid and lab.get(e["target"]) == "size()"
+    ]
+    # the implementation is linked to the protocol it satisfies
+    impl_pairs = {
+        (lab.get(e["source"]), lab.get(e["target"]))
+        for e in r["edges"] if e["relation"] == "implements"
+    }
+    assert ("Sizeable (for List)", "Sizeable") in impl_pairs
+
+
+def test_elixir_protocol_impl_produce_no_dangling_edges(tmp_path):
+    """An implementation of a protocol defined in ANOTHER file must not leave a
+    dangling `implements` edge behind."""
+    src = tmp_path / "impl_only.ex"
+    src.write_text(
+        "defimpl Sizeable, for: Map do\n"
+        "  def size(data), do: map_size(data)\n"
+        "end\n"
+    )
+    r = extract_elixir(src)
+    ids = {n["id"] for n in r["nodes"]}
+    for e in r["edges"]:
+        if e["relation"] == "imports":
+            continue
+        assert e["source"] in ids and e["target"] in ids, e
+
+
 # ── Objective-C ──────────────────────────────────────────────────────────────
 from graphify.extract import extract_objc
 
@@ -2235,6 +2295,64 @@ def test_julia_abstract_type_with_supertype_is_extracted(tmp_path):
     assert ("Dog", "Animal") in _edge_labels(r, "inherits"), "abstract inherits edge dropped"
 
 
+def test_julia_macro_definition_is_extracted(tmp_path):
+    """`macro name(...) ... end` must be a definition, with the calls in its
+    body attributed to it. Macros are first-class Julia definitions and were
+    dropped entirely."""
+    f = tmp_path / "macros.jl"
+    f.write_text(
+        "function helper(x)\n"
+        "    return x + 1\n"
+        "end\n"
+        "macro sayhello(name)\n"
+        "    return :( helper($name) )\n"
+        "end\n"
+    )
+    r = extract_julia(f)
+    assert "error" not in r
+    labels = [n["label"] for n in r["nodes"]]
+    assert "@sayhello" in labels, "macro definition dropped"
+    # the macro body's call to a helper is credited to the macro, not a self-loop
+    assert ("@sayhello", "helper") in _edge_labels(r, "calls")
+    assert ("@sayhello", "@sayhello") not in _edge_labels(r, "calls")
+
+
+def test_julia_enum_and_members_are_extracted(tmp_path):
+    """`@enum` defines a type and its members across the inline, begin/end block,
+    explicit-value, and typed forms. The whole macrocall was previously ignored,
+    and valued/typed forms silently dropped their members or mislabeled the type."""
+    f = tmp_path / "enums.jl"
+    f.write_text(
+        "@enum Fruit apple orange banana\n"
+        "@enum Color begin\n"
+        "  red\n"
+        "  green\n"
+        "end\n"
+        "@enum Priority low=1 high=2\n"
+        "@enum Size::UInt8 small medium large\n"
+    )
+    r = extract_julia(f)
+    assert "error" not in r
+    labels = {n["label"] for n in r["nodes"]}
+    assert {"Fruit", "apple", "orange", "banana", "Color", "red", "green",
+            "Priority", "low", "high", "Size", "small", "medium", "large"} <= labels
+    # enum members use `case_of` (shared tree-sitter convention), not `contains`
+    case_of = _edge_labels(r, "case_of")
+    assert {("Fruit", "apple"), ("Fruit", "banana"),
+            ("Color", "red"), ("Color", "green"),
+            ("Priority", "low"), ("Priority", "high"),  # explicit values
+            ("Size", "small"), ("Size", "large")} <= case_of  # typed enum
+    # the typed enum's backing type is not mistaken for a member
+    assert ("Size", "UInt8") not in case_of
+    # the members hang off their enum, not the file
+    file_nid = next(n["id"] for n in r["nodes"] if n["label"] == "enums.jl")
+    lab = {n["id"]: n["label"] for n in r["nodes"]}
+    assert not [
+        e for e in r["edges"]
+        if e["source"] == file_nid and lab.get(e["target"]) in {"apple", "red", "low", "small"}
+    ]
+
+
 def test_julia_struct_field_type_context():
     r = extract_julia(FIXTURES / "sample.jl")
     assert ("Point", "Float64") in _edge_labels(r, "references", "field")
@@ -2359,6 +2477,68 @@ def test_fortran_capital_F_parses_preprocessed():
     labels = [n["label"] for n in r["nodes"]]
     assert "shapes" in labels
     assert any("compute_volume" in l for l in labels)
+
+
+def test_fortran_type_bound_procedures_link_to_the_type(tmp_path):
+    """A derived type's `contains` section binds procedures as its methods.
+
+    Both the renaming form (`procedure :: area => circle_area`) and the plain
+    form (`procedure :: scale`) must connect the type to the module procedure
+    that implements it; before this the whole binding was dropped and the type
+    had no link to its own methods.
+    """
+    src = tmp_path / "geom.f90"
+    src.write_text(
+        "module geom\n"
+        "  type :: circle\n"
+        "    real :: radius\n"
+        "  contains\n"
+        "    procedure :: area => circle_area\n"
+        "    procedure :: scale\n"
+        "  end type circle\n"
+        "contains\n"
+        "  real function circle_area(self)\n"
+        "    class(circle), intent(in) :: self\n"
+        "    circle_area = 3.14159 * self%radius**2\n"
+        "  end function circle_area\n"
+        "  subroutine scale(self, f)\n"
+        "    class(circle), intent(inout) :: self\n"
+        "    real, intent(in) :: f\n"
+        "    self%radius = self%radius * f\n"
+        "  end subroutine scale\n"
+        "end module geom\n",
+        encoding="utf-8",
+    )
+    r = extract_fortran(src)
+    assert "error" not in r
+    methods = _edge_labels(r, "method", "type_bound_procedure")
+    assert ("circle", "circle_area") in methods
+    assert ("circle", "scale") in methods
+
+
+def test_fortran_type_bound_procedure_from_other_module_is_sourceless(tmp_path):
+    """A binding to a procedure implemented in another module resolves to a
+    sourceless stub the corpus rewire can collapse, never a dangling edge."""
+    src = tmp_path / "shape.f90"
+    src.write_text(
+        "module shape\n"
+        "  use draw_mod\n"
+        "  type :: widget\n"
+        "  contains\n"
+        "    procedure :: render => external_render\n"
+        "  end type widget\n"
+        "end module shape\n",
+        encoding="utf-8",
+    )
+    r = extract_fortran(src)
+    node_ids = {n["id"] for n in r["nodes"]}
+    # the binding still produced an edge...
+    assert ("widget", "external_render") in _edge_labels(r, "method", "type_bound_procedure")
+    # ...with a resolvable target node and no dangling endpoints
+    for e in r["edges"]:
+        assert e["source"] in node_ids and e["target"] in node_ids, e
+    stub = next(n for n in r["nodes"] if n["label"] == "external_render")
+    assert stub["source_file"] == ""
 
 
 # ── PowerShell ───────────────────────────────────────────────────────────────
@@ -3119,6 +3299,46 @@ def test_markdown_wikilink_fallback_unicode_normalization(tmp_path):
                for e in refs), f"NFD wikilink missed the NFC file: {refs}"
 
 
+def test_markdown_wikilink_index_prunes_ignored_directories(tmp_path, monkeypatch):
+    """#3822: _build_link_index must prune directories and files matched by
+    .graphifyignore/.gitignore, preventing both 50+ min directory walks on
+    large ignored trees and wikilinks erroneously resolving into ignored files."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / ".graphifyignore").write_text("bigdata/\nsecret.md\n", encoding="utf-8")
+
+    (vault / "notes").mkdir()
+    (vault / "notes" / "hub.md").write_text("# Hub\nSee [[target]] and [[secret]].\n", encoding="utf-8")
+    (vault / "notes" / "target.md").write_text("# Target\n", encoding="utf-8")
+
+    (vault / "bigdata").mkdir()
+    (vault / "bigdata" / "sub").mkdir()
+    (vault / "bigdata" / "sub" / "secret.md").write_text("# Secret in bigdata\n", encoding="utf-8")
+
+    import os
+    visited = []
+    real_walk = os.walk
+
+    def spy_walk(top, *args, **kwargs):
+        for dirpath, dirnames, filenames in real_walk(top, *args, **kwargs):
+            visited.append(os.path.relpath(dirpath, str(vault)))
+            yield dirpath, dirnames, filenames
+
+    monkeypatch.setattr(os, "walk", spy_walk)
+
+    node_ids, refs, page_id = _vault_extract(
+        vault, [vault / "notes" / "hub.md", vault / "notes" / "target.md"]
+    )
+
+    bigdata_walked = [v for v in visited if v.startswith("bigdata")]
+    assert not bigdata_walked, f"ignored directory descended during index walk: {bigdata_walked}"
+
+    hub_id = page_id(vault / "notes" / "hub.md")
+    target_id = page_id(vault / "notes" / "target.md")
+    assert any(e["source"] == hub_id and e["target"] == target_id for e in refs), f"valid target link lost: {refs}"
+    assert not any("bigdata" in e["target"] for e in refs), f"wikilink resolved into ignored path: {refs}"
+
+
 # ── Groovy ───────────────────────────────────────────────────────────────────
 
 
@@ -3185,6 +3405,44 @@ def test_groovy_implements_edge():
         for e in r["edges"] if e["relation"] == "implements"
     )
     assert found, "ExtendedService should have implements edge to Resettable"
+
+
+def test_groovy_enum_and_constants_are_extracted(tmp_path):
+    """A Groovy `enum` must become a type node with a `case_of` edge per member.
+
+    `enum_declaration` was absent from the Groovy config's class_types, so the
+    enum type — and every constant it declared — was dropped entirely, leaving
+    consumers with no way to see which value a branch selects.
+    """
+    src = tmp_path / "cards.groovy"
+    src.write_text(
+        "enum Suit { HEARTS, SPADES, CLUBS, DIAMONDS }\n"
+        "class Deck {}\n"
+    )
+    r = extract_groovy(src)
+    assert "error" not in r
+    labels = _labels(r)
+    assert "Suit" in labels, "enum type dropped"
+    cases = {
+        (node_id_label(r, e["source"]), node_id_label(r, e["target"]))
+        for e in r["edges"] if e["relation"] == "case_of"
+    }
+    assert {("Suit", "HEARTS"), ("Suit", "SPADES"),
+            ("Suit", "CLUBS"), ("Suit", "DIAMONDS")} <= cases
+    # constants hang off the enum, not the file
+    file_nid = next(n["id"] for n in r["nodes"] if n["label"] == "cards.groovy")
+    lab = {n["id"]: n["label"] for n in r["nodes"]}
+    assert not [
+        e for e in r["edges"]
+        if e["source"] == file_nid and lab.get(e["target"]) == "HEARTS"
+    ]
+
+
+def node_id_label(r, nid):
+    for n in r["nodes"]:
+        if n["id"] == nid:
+            return n["label"]
+    return nid
 
 
 def test_groovy_spock_finds_class():
@@ -4568,3 +4826,87 @@ def test_robot_path_variables_match_case_space_underscore_insensitively():
     assert _resolve_robot_import("..${/}Resource${/}common.robot", rel_src) == P("Tests/Resource/common.robot")
     # any other variable, in any casing, still yields no edge
     assert _resolve_robot_import("${Root_Dir}/x.robot", rel_src) is None
+
+
+def test_kotlin_class_annotation_emits_attribute_edge(tmp_path):
+    from graphify.extract import extract_kotlin
+    source = tmp_path / "ClassAnnotation.kt"
+    source.write_text("@Entity class User")
+    result = extract_kotlin(source)
+    refs = _edge_labels(result, "references", "attribute")
+    assert ("User", "Entity") in refs
+
+def test_kotlin_parameterized_annotation_emits_attribute_edge(tmp_path):
+    from graphify.extract import extract_kotlin
+    source = tmp_path / "ParamAnnotation.kt"
+    source.write_text('@Table(name="users") class User')
+    result = extract_kotlin(source)
+    refs = _edge_labels(result, "references", "attribute")
+    assert ("User", "Table") in refs
+
+def test_kotlin_use_site_target_annotation_emits_edge(tmp_path):
+    from graphify.extract import extract_kotlin
+    source = tmp_path / "UseSite.kt"
+    source.write_text('class User(@field:NotNull val name: String)')
+    result = extract_kotlin(source)
+    refs = _edge_labels(result, "references", "attribute")
+    assert ("User", "NotNull") in refs
+
+def test_kotlin_function_annotation_emits_attribute_edge(tmp_path):
+    from graphify.extract import extract_kotlin
+    source = tmp_path / "FuncAnnotation.kt"
+    source.write_text('class Controller { @GetMapping fun foo() {} }')
+    result = extract_kotlin(source)
+    refs = _edge_labels(result, "references", "attribute")
+    assert ("foo", "GetMapping") in refs
+
+def test_kotlin_primary_constructor_val_emits_field_type_edge(tmp_path):
+    from graphify.extract import extract_kotlin
+    source = tmp_path / "ConstructorField.kt"
+    source.write_text('class Order(val user: User)')
+    result = extract_kotlin(source)
+    refs = _edge_labels(result, "references", "field")
+    assert ("Order", "User") in refs
+
+def test_kotlin_primary_constructor_plain_param_is_not_a_field(tmp_path):
+    # Only `val`/`var` constructor params are properties; a bare param is not.
+    from graphify.extract import extract_kotlin
+    source = tmp_path / "PlainParam.kt"
+    source.write_text('class Order(val user: User, note: Note)')
+    result = extract_kotlin(source)
+    refs = _edge_labels(result, "references", "field")
+    assert ("Order", "User") in refs
+    assert ("Order", "Note") not in refs
+
+def test_kotlin_primary_constructor_annotations_emits_attribute_edge(tmp_path):
+    from graphify.extract import extract_kotlin
+    source = tmp_path / "ConstructorAnnotations.kt"
+    source.write_text('class User(@Id val id: Long)')
+    result = extract_kotlin(source)
+    refs = _edge_labels(result, "references", "attribute")
+    assert ("User", "Id") in refs
+
+def test_kotlin_primary_constructor_generic_field_emits_generic_arg(tmp_path):
+    from graphify.extract import extract_kotlin
+    source = tmp_path / "ConstructorGeneric.kt"
+    source.write_text('class User(@OneToMany val orders: List<Order>)')
+    result = extract_kotlin(source)
+    refs = _edge_labels(result, "references", "generic_arg")
+    assert ("User", "Order") in refs
+
+def test_kotlin_body_property_annotation_emits_attribute_edge(tmp_path):
+    from graphify.extract import extract_kotlin
+    source = tmp_path / "BodyProperty.kt"
+    source.write_text('class Foo { @Transient var x: String = "" }')
+    result = extract_kotlin(source)
+    refs = _edge_labels(result, "references", "attribute")
+    assert ("Foo", "Transient") in refs
+
+def test_kotlin_bracketed_annotations_emits_multiple_attribute_edges(tmp_path):
+    from graphify.extract import extract_kotlin
+    source = tmp_path / "BracketedAnnotations.kt"
+    source.write_text('class Foo { @set:[Inject VisibleForTesting] var x: String = "" }')
+    result = extract_kotlin(source)
+    refs = _edge_labels(result, "references", "attribute")
+    assert ("Foo", "Inject") in refs
+    assert ("Foo", "VisibleForTesting") in refs
