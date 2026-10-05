@@ -1246,6 +1246,42 @@ def test_php_finds_static_property_access():
     r = extract_php(FIXTURES / "sample_php_static_prop.php")
     assert "uses_static_prop" in _relations(r)
 
+
+def test_php_enum_cases_have_case_of_edge(tmp_path):
+    """Each PHP 8.1 enum case must be a node with a `case_of` edge to its enum.
+
+    `enum_declaration` is in PHP's class_types, so the enum type and its methods
+    were captured, but the cases nest in the `enum_declaration_list` body as
+    `enum_case` nodes that nothing handled — so they were dropped and the enum was
+    left a caseless leaf. This brings PHP to parity with Java #1719, Scala, Swift,
+    and C++. Backed enums (`: string` with `= 'H'`) and pure enums both apply, and
+    enum methods must still be captured.
+    """
+    f = tmp_path / "suit.php"
+    f.write_text(
+        "<?php\n"
+        "enum Suit: string {\n"
+        "    case Hearts = 'H';\n"
+        "    case Spades = 'S';\n"
+        "    public function color(): string { return 'x'; }\n"
+        "}\n"
+        "enum Status {\n"
+        "    case Active;\n"
+        "    case Closed;\n"
+        "}\n"
+    )
+    r = extract_php(f)
+    assert "error" not in r
+    labels = set(_labels(r))
+    assert {"Hearts", "Spades", "Active", "Closed"} <= labels
+    case_of = _edge_labels(r, "case_of")
+    assert ("Suit", "Hearts") in case_of
+    assert ("Suit", "Spades") in case_of
+    assert ("Status", "Active") in case_of
+    assert ("Status", "Closed") in case_of
+    # The enum's method must still be present (body walk not broken by the cases).
+    assert any(l == ".color()" for l in labels)
+
 def test_php_static_prop_target_is_holding_class():
     r = extract_php(FIXTURES / "sample_php_static_prop.php")
     node_by_id = {n["id"]: n["label"] for n in r["nodes"]}
@@ -1736,6 +1772,47 @@ def test_elixir_guarded_single_clause_is_extracted(tmp_path):
     assert "guarded_private" in labels, (
         f"single-clause guarded defp dropped: {sorted(labels)}"
     )
+
+
+def test_elixir_defmacro_and_defguard_are_extracted(tmp_path):
+    """`defmacro`/`defmacrop`/`defguard`/`defguardp` must become member nodes.
+
+    They define named, invocable members with the same head shape as `def`/`defp`
+    (a `call` head, optionally wrapped in a `when` binary_operator), but only
+    def/defp were handled — so macros and guard macros fell through to the generic
+    recursion and were dropped entirely. The member was never a node, and a call
+    to a locally-defined macro had nothing to resolve to.
+    """
+    src = tmp_path / "macros.ex"
+    src.write_text(
+        "defmodule MyMod do\n"
+        "  defmacro trace(expr) do\n"
+        "    quote do: unquote(expr)\n"
+        "  end\n"
+        "\n"
+        "  defmacrop priv_macro(x) do\n"
+        "    quote do: unquote(x)\n"
+        "  end\n"
+        "\n"
+        "  defguard is_even(x) when is_integer(x) and rem(x, 2) == 0\n"
+        "\n"
+        "  defguardp is_small(x) when is_integer(x) and x < 10\n"
+        "\n"
+        "  def run(x) do\n"
+        "    trace(priv_macro(x))\n"
+        "  end\n"
+        "end\n"
+    )
+    r = extract_elixir(src)
+    assert "error" not in r
+    labels = {(n.get("label") or "").rstrip("()") for n in r["nodes"]}
+    assert "trace" in labels, f"defmacro dropped: {sorted(labels)}"
+    assert "priv_macro" in labels, f"defmacrop dropped: {sorted(labels)}"
+    assert "is_even" in labels, f"defguard dropped: {sorted(labels)}"
+    assert "is_small" in labels, f"defguardp dropped: {sorted(labels)}"
+    # A call to a locally-defined macro now resolves to the macro's node.
+    calls = _calls(r)
+    assert ("run()", "trace()") in calls
 
 
 def test_elixir_protocol_and_impl_are_extracted(tmp_path):
@@ -2602,6 +2679,67 @@ def test_powershell_finds_class_and_method():
     assert any("Transform" in l for l in labels)
 
 
+def test_powershell_this_method_call_resolves(tmp_path):
+    """`$this.Square(3)` inside a class method is a call to a sibling method and
+    must link the two. The invocation parses as an `invokation_expression`, but
+    only the bare-command form was walked, so every method call was dropped from
+    the call graph (#3992)."""
+    f = tmp_path / "calc.ps1"
+    f.write_text(
+        "class Calc {\n"
+        "    [int] Square([int]$x) { return $x * $x }\n"
+        "    [int] Run() { return $this.Square(3) }\n"
+        "}\n"
+    )
+    r = extract_powershell(f)
+    assert "error" not in r
+    assert ("Run", "Square") in _edge_labels(r, "calls")
+
+
+def test_powershell_static_method_call_resolves(tmp_path):
+    """The static `[Calc]::Make()` form is also an `invokation_expression` and
+    must resolve to the method (#3992)."""
+    f = tmp_path / "calc.ps1"
+    f.write_text(
+        "class Calc {\n"
+        "    static [Calc] Make() { return [Calc]::new() }\n"
+        "    [Calc] Run() { return [Calc]::Make() }\n"
+        "}\n"
+    )
+    r = extract_powershell(f)
+    assert ("Run", "Make") in _edge_labels(r, "calls")
+
+
+def test_powershell_member_call_does_not_bind_to_free_function(tmp_path):
+    """Fail-closed: a method call on an unknown receiver (`$obj.Process()`) must
+    NOT bind to a free function that merely shares the name — member calls
+    resolve only to methods (#3992)."""
+    f = tmp_path / "calc.ps1"
+    f.write_text(
+        "function Process { return 1 }\n"
+        "class Calc {\n"
+        "    [int] Run() {\n"
+        "        $obj = Get-Thing\n"
+        "        return $obj.Process()\n"
+        "    }\n"
+        "}\n"
+    )
+    r = extract_powershell(f)
+    assert ("Run", "Process") not in _edge_labels(r, "calls")
+
+
+def test_powershell_command_call_still_resolves(tmp_path):
+    """Positive control: the bare-command call path that already worked must
+    keep working (#3992)."""
+    f = tmp_path / "mod.ps1"
+    f.write_text(
+        "function Helper { return 1 }\n"
+        "function Run { Helper }\n"
+    )
+    r = extract_powershell(f)
+    assert ("Run", "Helper") in _edge_labels(r, "calls")
+
+
 def test_powershell_class_base_type_emits_inherits_edge():
     # `class Circle : Shape` — the base type after ':' was previously dropped
     # because the handler only read the first simple_name (the class name).
@@ -2625,17 +2763,42 @@ def test_powershell_enum_is_extracted_and_reference_resolves(tmp_path):
     color = next((n for n in r["nodes"] if n["label"] == "Color"), None)
     assert color is not None, "enum definition dropped"
     assert color["source_file"] != "", "enum must be a real sourced definition, not a phantom stub"
-    # members are captured
-    contained = {
+    # members are captured, hanging off the enum via case_of (not contains)
+    cases = {
         n["label"] for n in r["nodes"]
         for e in r["edges"]
-        if e["relation"] == "contains" and e["source"] == color["id"] and e["target"] == n["id"]
+        if e["relation"] == "case_of" and e["source"] == color["id"] and e["target"] == n["id"]
     }
-    assert {"Red", "Green", "Blue"} <= contained, f"enum members missing: {contained}"
+    assert {"Red", "Green", "Blue"} <= cases, f"enum members missing: {cases}"
     # the field type reference resolves to the real enum node
     ref_targets = {e["target"] for e in r["edges"]
                    if e["relation"] == "references" and e.get("context") == "field"}
     assert color["id"] in ref_targets, "[Color] field reference did not resolve to the enum"
+
+
+def test_powershell_enum_members_emit_case_of_not_contains(tmp_path):
+    """A PowerShell enum member is a discriminant case, so it must get a
+    `case_of` edge like every other language with enums (Java #1719, C#, Swift,
+    Rust, VB.NET), not the `contains` edge used for real class fields.
+    PowerShell was routing enum members through the same `contains` path as a
+    class property. The relation also matters to resolution: `case_of` targets
+    are excluded from constructor binding, so an enum member named like a type
+    can no longer be mistaken for one.
+    """
+    f = tmp_path / "status.ps1"
+    f.write_text("enum Status {\n    Active\n    Paused\n    Closed\n}\n")
+    r = extract_powershell(f)
+    case_of = _edge_labels(r, "case_of")
+    contains = _edge_labels(r, "contains")
+    # Each enum member hangs off its enum via case_of, not contains.
+    assert ("Status", "Active") in case_of
+    assert ("Status", "Paused") in case_of
+    assert ("Status", "Closed") in case_of
+    assert ("Status", "Active") not in contains
+    # Containment itself (the file owning the enum type) still uses `contains`;
+    # only the member-to-enum relation changed.
+    assert ("status.ps1", "Status") in contains
+    assert ("status.ps1", "Status") not in case_of
 
 
 def test_powershell_property_field_type_context():
@@ -4760,6 +4923,90 @@ def test_zig_enum_members_emit_case_of_nodes(tmp_path):
     # not be emitted as a node or gain a case_of edge.
     assert "x" not in labels
     assert not any(src_lbl == "Point" for src_lbl, _ in case_of)
+
+
+@_needs_zig
+def test_zig_error_set_members_emit_case_of_nodes(tmp_path):
+    """A Zig error set must become a type node with a `case_of` edge per member.
+
+    `const E = error{ A, B };` parses as a `variable_declaration` whose value is
+    an `error_set_declaration`. That value node type was not recognised, so the
+    whole declaration fell through and BOTH the error type and its members were
+    dropped. An error set is a named enumeration of error values — the direct
+    parallel of a Zig enum — so emit the type plus a node + `case_of` edge per
+    member identifier, matching the enum handling (and Java #1719 / Swift / Scala).
+    """
+    src = (
+        "const FileError = error{ NotFound, PermissionDenied };\n"
+        "fn open() FileError!void { return error.NotFound; }\n"
+    )
+    f = tmp_path / "errors.zig"
+    f.write_text(src)
+    r = extract_zig(f)
+    assert "error" not in r
+    id_to_label = {n["id"]: n["label"] for n in r["nodes"]}
+    labels = set(id_to_label.values())
+    # Pre-fix the whole `const FileError = error{...}` declaration vanished.
+    assert "FileError" in labels
+    assert {"NotFound", "PermissionDenied"} <= labels
+    case_of = {
+        (id_to_label.get(e["source"], e["source"]),
+         id_to_label.get(e["target"], e["target"]))
+        for e in r["edges"] if e["relation"] == "case_of"
+    }
+    assert ("FileError", "NotFound") in case_of
+    assert ("FileError", "PermissionDenied") in case_of
+
+
+@_needs_zig
+def test_zig_tagged_union_variants_emit_case_of_nodes(tmp_path):
+    """A tagged union's variants must become nodes with a `case_of` edge each.
+
+    The `container_field` branch only fired for an `enum_declaration` parent, so a
+    tagged union (`union(enum) { circle: f64, point }`) kept its methods but
+    dropped every variant, leaving the union a near-memberless leaf. A tagged
+    union's fields are its discriminant cases — the same shape as enum members —
+    so they get the same node + `case_of` edge (Java #1719 / Swift / Scala
+    parity). A bare `union { ... }` has typed data fields, not cases, so — like a
+    struct's fields — it stays untouched.
+    """
+    src = (
+        "const Shape = union(enum) {\n"
+        "    circle: f64,\n"
+        "    rectangle: struct { w: f64, h: f64 },\n"
+        "    point,\n"
+        "};\n"
+        "const Payload = union(Tag) { int: i64, text: []const u8 };\n"
+        "const Bare = union { int: i64, float: f64 };\n"
+    )
+    f = tmp_path / "shapes.zig"
+    f.write_text(src)
+    r = extract_zig(f)
+    assert "error" not in r
+    id_to_label = {n["id"]: n["label"] for n in r["nodes"]}
+    labels = set(id_to_label.values())
+    # Pre-fix every tagged-union variant was dropped.
+    assert {"circle", "rectangle", "point", "int", "text"} <= labels
+    case_of = {
+        (id_to_label.get(e["source"], e["source"]),
+         id_to_label.get(e["target"], e["target"]))
+        for e in r["edges"] if e["relation"] == "case_of"
+    }
+    assert ("Shape", "circle") in case_of
+    assert ("Shape", "rectangle") in case_of
+    assert ("Shape", "point") in case_of
+    assert ("Payload", "int") in case_of
+    assert ("Payload", "text") in case_of
+    # A bare (untagged) union's fields are typed data, not cases: no case_of, and
+    # the data fields must not be minted as member nodes.
+    assert not any(src_lbl == "Bare" for src_lbl, _ in case_of)
+    assert "float" not in labels
+    # A variant's nested-struct payload is not recursed into (#4074): `rectangle`
+    # is minted as a variant, but its `w`/`h` fields are not, and `rectangle`
+    # owns no `case_of` edges of its own.
+    assert "w" not in labels
+    assert "h" not in labels
+    assert not any(src_lbl == "rectangle" for src_lbl, _ in case_of)
 
 
 @_needs_commonlisp
