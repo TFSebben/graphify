@@ -126,6 +126,28 @@ def test_ts_named_reexport_alias_from_index_resolves_imported_symbol_to_origin(t
     )
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_re_export_survives_for_both_files_whose_ids_collide(tmp_path: Path, reverse: bool):
+    """`a-b/x.ts` and `a/b/x.ts` both normalize to `a_b_x`. Each re-exports the
+    same module, so each must keep its own re_exports edge whatever the order the
+    files are processed in; the second one used to be deduped as a copy of the
+    first before the colliding ids were split."""
+    util = _write(tmp_path / "lib/util.ts", "export function helper() { return 1; }\n")
+    dashed = _write(tmp_path / "a-b/x.ts", "export * from '../lib/util'\n")
+    nested = _write(tmp_path / "a/b/x.ts", "export * from '../../lib/util'\n")
+    paths = [util, dashed, nested]
+
+    result = _extract_for(list(reversed(paths)) if reverse else paths, tmp_path)
+
+    by_id = {node["id"]: node for node in result["nodes"]}
+    re_exporters = sorted(
+        Path(by_id[edge["source"]]["source_file"]).as_posix()
+        for edge in result["edges"]
+        if edge["relation"] == "re_exports" and edge["target"] == _file_node_id(Path("lib/util.ts"))
+    )
+    assert re_exporters == ["a-b/x.ts", "a/b/x.ts"]
+
+
 def test_ts_export_star_from_index_resolves_imported_symbol_to_origin(tmp_path: Path):
     target = _write(tmp_path / "src/lib/foo.ts", "export class Foo { id = '' }\n")
     barrel = _write(tmp_path / "src/lib/index.ts", "export * from './foo'\n")
@@ -1091,6 +1113,37 @@ def test_unresolved_relative_import_uses_stable_ref_target(tmp_path: Path):
         for edge in result["edges"]
     )
 
+
+
+def test_unresolved_relative_require_uses_stable_ref_target(tmp_path: Path):
+    """CommonJS require() of a missing local module took a separate path from
+    static imports and still minted its target, and every destructured symbol
+    under it, from the attempted absolute path: the checkout location and the
+    OS username ended up in node ids (#2457 residual)."""
+    importer = _write(
+        tmp_path / "src/consumer.js",
+        "const { loadFoundation } = require('./generated/api');\n"
+        "function run() { return loadFoundation(); }\n"
+        "module.exports = { run };\n",
+    )
+
+    result = _extract_for([importer], tmp_path)
+    source = _file_node_id(Path("src/consumer.js"))
+    imports_from = [
+        edge["target"]
+        for edge in result["edges"]
+        if edge["source"] == source and edge["relation"] == "imports_from"
+    ]
+
+    assert imports_from == [_make_id("ref", "./generated/api")]
+    checkout = _make_id(str(tmp_path))
+    leaked = [
+        endpoint
+        for edge in result["edges"]
+        for endpoint in (edge["source"], edge["target"])
+        if checkout in endpoint
+    ] + [node["id"] for node in result["nodes"] if checkout in node["id"]]
+    assert leaked == []
 
 # ── #927: wildcard tsconfig path patterns ────────────────────────────────────
 

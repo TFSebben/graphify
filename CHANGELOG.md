@@ -2,6 +2,46 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/Graphify-Labs/graphify/releases)
 
+## 0.9.80 (2026-10-07)
+
+More clone-identical determinism, a large MCP retrieval speedup, and a batch of extractor and resolution fixes.
+
+- Fix: more node ids and manifest keys stop leaking the local checkout path or OS username, so a clone keeps producing the same graph — a re-clone no longer keeps a previous checkout's absolute manifest keys (#4175, thanks @SrijanSriv), an AST cache hit whose import target has since been deleted is re-extracted instead of replaying the stale absolute-path id (#4185, #4184, thanks @rohit-jsfreaky), and `--no-cluster` graph.json no longer ships `extract()`'s run-only absolute source paths or undeclared/dangling endpoints (#4189, #4183, thanks @rohit-jsfreaky).
+- Fix: cross-drive scans no longer abort on a syntax-error warning — the remaining unguarded `os.path.relpath` in the partial-extraction warning path falls back to a portable display path on Windows cross-drive files, completing the 0.9.78 #4106 fix (#4149, thanks @xiehuanyi).
+- Fix: an external import stub whose last referencing edge is gone is dropped on incremental rebuild instead of lingering as a zero-degree ghost a fresh build never has (#4181, thanks @rohit-jsfreaky).
+- Fix: **Python** `self.<attr>.<method>()` calls now resolve through the attribute's constructor/annotation type to the owning class, fail-closed on ambiguity (#4176, #2860, thanks @Mpasha17).
+- Fix: **Python** `obj.method()` on a local or parameter whose class is known from an annotation (`c: Client`, including `Optional`/union/string forms) or a constructor/`with` binding now resolves to the owning class's method, fail-closed to a single in-file-or-imported class that owns it (#4198, thanks @rohit-jsfreaky).
+- Fix: **Python** imports under `if TYPE_CHECKING:` are marked type-only so they no longer form impossible runtime import cycles (#4179, #3159, thanks @Yyunozor).
+- Fix: **Java** methods and the calls inside anonymous class bodies (`new Runnable() { public void run() {...} }`) are now captured, mirroring the Kotlin object-literal handling (#4140, thanks @rajatnagda45).
+- Fix: **markdown** links to file names containing spaces or percent-encoding (`[x](<My Note.md>)`, `[x](My%20Note.md)`) resolve to the real file instead of a ghost target; wikilinks stay verbatim and external links stay excluded (#4178, thanks @Yyunozor).
+- Fix: a `re_exports` edge is kept for both files whose ids collide after separator normalization (`a-b/x.ts` and `a/b/x.ts`), removing an order-dependent dropped edge (#4143, thanks @Cintu07).
+- Fix: the Windows `graphify` console script now uses the multi-core extraction pool instead of silently falling back to single-core, since a non-file `__main__.__file__` no longer disables it (#4187, #4186, thanks @rohit-jsfreaky).
+- Perf: the MCP server builds the traversal view and shortest-path graphs once per loaded graph instead of rebuilding them on every call, keyed to the existing graph cache (~1.6x on `query_graph`, up to ~300x on `shortest_path`); the two cached path graphs add a bounded, LRU-capped memory cost (#4192, #4191, thanks @rohit-jsfreaky).
+- Perf: the extraction id-remap and call tie-break resolve and parse each path once per run instead of recomputing it for every node and candidate (tens of thousands of redundant `Path.resolve()` calls eliminated), with byte-identical graph.json output (#4195, thanks @rohit-jsfreaky).
+- Feature: `graph_stats` (CLI and MCP) now reports the graph's build commit and whether it is behind the current HEAD (#4144, thanks @Mpasha17).
+- Chore: raise the `tree-sitter` runtime floor to `>=0.25` so a resolver cannot pair a 0.23/0.24 runtime (ABI 14) with the ABI-15 grammars pinned here and fail every parse (#4148, thanks @JFWaskin).
+- Test: optional-extra tests now skip cleanly when the extra is not installed, so a default `uv sync` no longer reports failures for grammars and SDKs it never pulled (#4193, #4190, thanks @yatharth1706).
+
+## 0.9.79 (2026-10-06)
+
+- Fix: incremental `graphify update` and `watch` no longer re-cluster and re-render on every run after an unchanged rebuild. The `schema_version`/`graphify_version` metadata added to `graph.json` in 0.9.78 (#4167) was being counted as a topology change by the watch unchanged-topology check, since the freshly-built candidate graph carries no such metadata; it is now excluded from the comparison.
+
+## 0.9.78 (2026-10-06)
+
+A determinism and portability batch: node ids no longer leak the checkout path, OS username, or line endings into graph.json, so a clone produces the same graph everywhere. Plus encoding, C#, PowerShell, C++, and watch-reconcile correctness fixes.
+
+- Fix: node ids no longer embed the local checkout path or OS username for unresolved targets — a missing `require('./x')` (#4155, #4154), a missing Python relative import `from .absent import x` (#4157, #4156), and a `.dmf` element keyed on its window (#4153, #4152) now mint portable, clone-identical ids; all three thanks @rohit-jsfreaky.
+- Fix: **C#** namespace scope ids are keyed on row/column instead of byte offset, so a CRLF checkout no longer writes different `scope_chain` metadata than an LF one (#4165, #4164, thanks @rohit-jsfreaky).
+- Fix: **R** symbol-only bindings (operators like `` `%||%` ``) no longer collapse onto the file node and spin `resolve_local` forever; they get a stable, collision-free id (#4171, #4162, thanks @xiehuanyi).
+- Fix: source files are decoded before parsing — a UTF-16 file no longer yields zero nodes and a cp1252 name like `CaféOrder` is no longer truncated; valid UTF-8 files are byte-for-byte unchanged, non-UTF-8 falls back deterministically (#4146, #4145, thanks @rohit-jsfreaky).
+- Fix: **C#** calls through a cast or an interface-typed property now resolve — `((IStore)x).Save()`, `(x as IStore).Save()`, and a shadowed `IStore Store => ...; Store.Save()` bind to the interface's own method instead of being dropped or mis-bound to the concrete class (#4172, #3797, thanks @Mpasha17).
+- Fix: **PowerShell** member calls bind by receiver owner rather than method name alone — `$this.M()` resolves to the enclosing class and `[Type]::M()` to a single unambiguous local class, fixing a same-name-method mis-bind; value, cast, dynamic, duplicate, and external receivers stay fail-closed (#4163, #4158, thanks @oleksii-tumanov).
+- Fix: **C++** classes behind module export macros (`class MYLIB_EXPORT Foo : Base {}`) are preserved — the ALL-CAPS macro is blanked before parsing (byte-length and newline preserving) so tree-sitter no longer error-recovers over the class and drops it (#3661, #3648, thanks @nikhilsaxena04).
+- Fix: incremental `graphify update` keeps placeholder nodes for never-scanned referenced files, so an unchanged referrer's cross-file edges to an unresolved import or a `.csproj`/`.sln` reference are no longer dropped as if the target were deleted; genuinely deleted files are still reaped (#4161, #4160, thanks @rohit-jsfreaky).
+- Fix: `graph_diff` keeps edge direction, so a reversed edge (a→b becomes b→a) is reported as a change instead of cancelling out to "no changes"; the diff now loads the previous graph through the direction-preserving reader (#4170, #4067, thanks @Mpasha17).
+- Perf: the watch reconcile pass computes each stored source path's identity once per update instead of recomputing it for every node, edge, and hyperedge, cutting reconcile on graphify's own repo from 10.2s to 2.7s with graph.json byte-identical (#4151, #4150, thanks @rohit-jsfreaky).
+- Feature: `graph.json` now carries `schema_version` and `graphify_version` metadata for downstream consumers, written additively so existing readers and older graphs are unaffected (#4167, #3638, thanks @smngvlkz).
+
 ## 0.9.77 (2026-10-05)
 
 More community language-structure coverage, two reload/incremental correctness fixes, and a batch of extractor tests.

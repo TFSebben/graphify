@@ -8,6 +8,8 @@ from graphify.extractors.base import (  # noqa: F401
     _LANGUAGE_BUILTIN_GLOBALS,
     _file_stem,
     _make_id,
+    _read_source_bytes,
+    _read_source_text,
     _read_text,
 )
 import functools
@@ -1246,18 +1248,24 @@ def _apply_symbol_resolution_facts(
         })
         return node_id
 
+    # Keyed by the emitting file as well: two files whose ids collide (`a-b/x.ts`
+    # and `a/b/x.ts` both make `a_b_x`) share `source` until
+    # _disambiguate_colliding_node_ids salts them by source_file, so without the
+    # file the second file's identical edge was dropped as a duplicate of the
+    # first, and which file kept it depended on processing order.
     existing_edges = {
         (
             str(edge.get("source")),
             str(edge.get("target")),
             str(edge.get("relation")),
             str(edge.get("context") or ""),
+            _js_source_path(str(edge.get("source_file") or ""), root),
         )
         for edge in edges
     }
 
     def add_edge(source: str, target: str, relation: str, context: str, line: int, source_path: Path, target_file: str | None = None, local_alias: str | None = None, type_only: bool = False) -> None:
-        key = (source, target, relation, context or "")
+        key = (source, target, relation, context or "", _js_source_path(str(source_path), root))
         if key in existing_edges:
             return
         existing_edges.add(key)
@@ -1639,11 +1647,11 @@ def _parse_js_tree(path: Path):
         vue_lang: str | None = None
         if path.suffix == ".vue":
             masked, vue_lang = _vue_mask_non_script(
-                path.read_text(encoding="utf-8", errors="replace")
+                _read_source_text(path, warn=False)
             )
             source = masked.encode("utf-8")
         else:
-            source = path.read_bytes()
+            source = _read_source_bytes(path, warn=False)
         use_ts = path.suffix in (".ts", ".mts", ".cts") or (
             path.suffix == ".vue" and vue_lang not in ("js", "jsx")
         )
@@ -2247,7 +2255,7 @@ def _collect_js_symbol_resolution_facts(paths: list[Path], facts: _SymbolResolut
 def _parse_python_tree_cached(path_str: str, _mtime_ns: int, _size: int):
     import tree_sitter_python as tspython
     from tree_sitter import Language, Parser
-    source = Path(path_str).read_bytes()
+    source = _read_source_bytes(Path(path_str), warn=False)
     parser = Parser(Language(tspython.language()))
     return source, parser.parse(source).root_node
 
@@ -3121,7 +3129,7 @@ def _resolve_cross_file_java_imports(
     pkg_by_src: dict[str, str] = {}
     for path, file_result in zip(paths, per_file):
         try:
-            source = path.read_bytes()
+            source = _read_source_bytes(path, warn=False)
             tree = parser.parse(source)
         except Exception:
             continue
@@ -3417,7 +3425,7 @@ def _resolve_java_type_references(
         if not srcs:
             continue
         try:
-            source = path.read_bytes()
+            source = _read_source_bytes(path, warn=False)
             tree = parser.parse(source)
         except Exception:
             continue
@@ -3693,7 +3701,7 @@ def _resolve_php_type_references(
         if not srcs:
             continue
         try:
-            source = path.read_bytes()
+            source = _read_source_bytes(path, warn=False)
             tree = parser.parse(source)
         except Exception:
             continue
