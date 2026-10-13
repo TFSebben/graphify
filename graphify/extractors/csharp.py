@@ -14,6 +14,7 @@ import html
 from pathlib import Path
 
 from graphify.extractors.base import _make_id
+from graphify.rcfile import effective_suffix
 
 
 def _build_csharp_type_def_index(
@@ -58,11 +59,7 @@ def _build_csharp_type_def_index(
         if all_edges is not None and nid in non_type_ids:
             continue
         source_file = node.get("source_file")
-        if (
-            not isinstance(source_file, str)
-            or not source_file.endswith(".cs")
-            or node.get("file_type") != "code"
-        ):
+        if not _is_cs_file(source_file) or node.get("file_type") != "code":
             continue
         if label.endswith(")") or label.startswith(".") or "." in label:
             continue
@@ -179,11 +176,11 @@ _DOTNET_SOURCE_EXTS = (".cs", ".razor", ".cshtml")
 
 
 def _is_cs_file(value: object) -> bool:
-    return isinstance(value, str) and value.endswith(".cs")
+    return isinstance(value, str) and effective_suffix(value) == ".cs"
 
 
 def _is_dotnet_source_file(value: object) -> bool:
-    return isinstance(value, str) and value.endswith(_DOTNET_SOURCE_EXTS)
+    return isinstance(value, str) and effective_suffix(value) in _DOTNET_SOURCE_EXTS
 
 
 def _metadata(value: object) -> dict:
@@ -230,7 +227,7 @@ class CsharpNameResolver:
             if not (
                 source_node
                 and isinstance(source_node.get("label"), str)
-                and source_node.get("label", "").endswith(_DOTNET_SOURCE_EXTS)
+                and _is_dotnet_source_file(source_node.get("label"))
             ):
                 continue
             source_file = source_node.get("source_file")
@@ -486,37 +483,46 @@ def _resolve_csharp_type_references(
                 return alias
         return stem or None
 
+    # One canonical sourceless stub per undeclared type NAME, shared across every
+    # file that references it (#4247). An external type the corpus uses but never
+    # declares (`List`, `System.Type`, Unity's `VisualElement`) used to get a
+    # separate per-file placeholder (`a_cs_list`, `b_cs_list`, ...) because the
+    # extractor mints one provisional placeholder per file and the arbiter kept
+    # whichever one each edge already pointed at. Coalesce them all onto a single
+    # name-keyed stub so a query for the type returns one node that connects the
+    # files sharing it.
+    canonical_stub_by_label: dict[str, str] = {}
+
+    def _canonical_stub_matches(nid: object, label: str) -> bool:
+        node = node_by_id.get(nid)
+        return _is_placeholder(node) and node.get("label") == label
+
     def _dangling_stub_id(label: str, current_target: object) -> str:
-        current = node_by_id.get(current_target)
-        if _is_placeholder(current) and current.get("label") == label:
-            return str(current_target)
+        cached = canonical_stub_by_label.get(label)
+        if cached is not None:
+            return cached
 
-        for node in all_nodes:
-            nid = node.get("id")
-            if (
-                isinstance(nid, str)
-                and node.get("label") == label
-                and _is_placeholder(node)
-            ):
-                return nid
-
-        stem = _make_id(label)
-        stub_id = stem
-        if stub_id in node_by_id:
+        stub_id = _make_id(label)
+        # Never shadow a real (sourced) node or a differently-labelled node; a
+        # placeholder already keyed by this bare name is reused as the canonical.
+        if stub_id in node_by_id and not _canonical_stub_matches(stub_id, label):
             stub_id = _make_id("csharp_type_ref", label)
             suffix = 2
-            while stub_id in node_by_id:
+            while stub_id in node_by_id and not _canonical_stub_matches(stub_id, label):
                 stub_id = _make_id("csharp_type_ref", label, str(suffix))
                 suffix += 1
-        node = {
-            "id": stub_id,
-            "label": label,
-            "file_type": "code",
-            "source_file": "",
-            "source_location": "",
-        }
-        all_nodes.append(node)
-        node_by_id[stub_id] = node
+
+        if stub_id not in node_by_id:
+            node = {
+                "id": stub_id,
+                "label": label,
+                "file_type": "code",
+                "source_file": "",
+                "source_location": "",
+            }
+            all_nodes.append(node)
+            node_by_id[stub_id] = node
+        canonical_stub_by_label[label] = stub_id
         return stub_id
 
     REPOINT_RELATIONS = {"implements", "inherits", "references"}
